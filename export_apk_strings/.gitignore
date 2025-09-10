@@ -1,0 +1,6 @@
+debug/
+*.apk
+*.csv
+*.xlsx
+*.xls
+.DS_Store
