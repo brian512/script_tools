@@ -43,7 +43,8 @@ python3 apk_string_extractor_local.py \
     --output strings_output.xlsx \
     --format excel \
     --languages default,zh-rCN,en,ja \
-    --tools-dir ./tools
+    --tools-dir ./tools \
+    --ignore-keys-file ignore_keys.txt
 
 # 使用配置文件的方式
 python3 apk_string_extractor_local.py \
@@ -68,6 +69,7 @@ python3 apk_string_extractor_simple.py \
 | `--languages` | - | **多语言列表（逗号分隔）** | 无 | ✅ | `--languages default,zh-rCN,en` |
 | `--lang-config` | `-l` | 语言配置文件 | 无 | ❌ | `-l supported_languages.txt` |
 | `--tools-dir` | - | 工具目录路径 | `./tools` | ❌ | `--tools-dir /path/to/tools` |
+| `--ignore-keys-file` | - | 忽略的字符串key清单（每行一个，支持#注释） | 无 | ❌ | `--ignore-keys-file ignore_keys.txt` |
 
 > **新增功能**: `--languages` 参数支持用逗号分隔的多语言列表，优先级高于配置文件，两个版本都支持。
 
@@ -99,6 +101,17 @@ ja
 ko
 fr
 de
+```
+
+### 忽略 Key 清单文件 (ignore_keys.txt)
+
+```
+# 来自第三方库或无需处理的 key，一行一个
+# 支持注释与空行
+
+abc_third_party_label
+tp_sdk_button_text
+firebase_common_version
 ```
 
 ## 🛠️ 目录结构

@@ -15,7 +15,7 @@ from pathlib import Path
 import tempfile
 import shutil
 import subprocess
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 import re
 from tqdm import tqdm
 
@@ -147,6 +147,8 @@ class APKStringExtractor:
         self.strings_data = {}
         self.languages = set()
         self.supported_languages = None  # 支持的业务语言列表
+        self.debug = False
+        self.debug_key: Optional[str] = None
         
         # 优先使用传入的语言列表
         if supported_langs:
@@ -423,14 +425,43 @@ class APKStringExtractor:
                 match = re.search(r'name="([^"]+)"', line)
                 if match:
                     current_string_name = match.group(1)
+                    if self.debug:
+                        print(f"[xmltree] 捕获到string名称: {current_string_name}")
             
             # 查找文本内容
             elif current_string_name and 'T:' in line:
-                match = re.search(r'T: "([^"]*)"', line)
-                if match:
-                    text = match.group(1)
-                    strings[current_string_name] = self._unescape_xml(text)
-                    current_string_name = None
+                # 使用可处理转义的消费函数，避免包含 \" 或 \' 的字符串被截断
+                if self.debug:
+                    print(f"[xmltree] 原始行: {line}")
+                try:
+                    t_index = line.find('T:')
+                    # 定位到 T: 之后的首个引号
+                    quote_index = line.find('"', t_index)
+                    if quote_index != -1:
+                        start_idx = quote_index + 1
+                        if self.debug:
+                            print(f"[xmltree] T:索引={t_index}, 首引号索引={quote_index}, start_idx={start_idx}")
+                        text = self._consume_quoted(line, start_idx)
+                        if self.debug:
+                            print(f"[xmltree] 提取原始: {repr(text)}")
+                        # aapt xmltree 的转义风格与 aapt2 基本一致，这里统一用专用反转义
+                        text = self._unescape_aapt_value(text)
+                        if self.debug:
+                            print(f"[xmltree] 反转义后: {repr(text)}")
+                        strings[current_string_name] = text
+                        if self.debug:
+                            print(f"[xmltree] 写入 {current_string_name} → {repr(text)}")
+                        current_string_name = None
+                    else:
+                        if self.debug:
+                            print("[xmltree] 未找到起始引号，跳过此行")
+                except Exception:
+                    # 回退到原有的简单匹配，尽量不影响整体流程
+                    match = re.search(r'T: "([^"]*)"', line)
+                    if match:
+                        text = match.group(1)
+                        strings[current_string_name] = self._unescape_xml(text)
+                        current_string_name = None
         
         return strings
     
@@ -648,20 +679,26 @@ class APKStringExtractor:
         current_string_data = {}
         in_string_section = False
         
-        for line in lines:
-            line = line.strip()
+        line_idx = 0
+        total_lines = len(lines)
+        while line_idx < total_lines:
+            raw_line = lines[line_idx]
+            line = raw_line.strip()
             
             # 检测字符串类型开始
             if 'type string' in line:
                 in_string_section = True
+                line_idx += 1
                 continue
             
             # 检测其他类型开始，退出字符串处理
             if in_string_section and line.startswith('type ') and 'string' not in line:
                 in_string_section = False
+                line_idx += 1
                 continue
             
             if not in_string_section:
+                line_idx += 1
                 continue
             
             # 解析字符串资源定义
@@ -673,21 +710,87 @@ class APKStringExtractor:
                 # 提取字符串名称
                 match = re.search(r'string/([^\s]+)', line)
                 if match:
-                    current_string_name = match.group(1)
+                    # 规范化名称：去除可能跟随的冒号
+                    current_string_name = match.group(1).rstrip(':')
                     current_string_data = {}
-            
+                line_idx += 1
+                continue
+
             # 解析字符串值
-            elif current_string_name and '"' in line:
-                # 尝试解析形如: (lang) "value"
+            elif current_string_name:
+                # 仅当符合形如: (lang) "value" 的结构时才解析，避免误把其它行当作值
                 m = re.match(r"\s*\(([^)]*)\)\s*\"", line)
                 if m:
                     language = m.group(1) or "default"
                     start_idx = m.end()
-                    value = self._consume_quoted(line, start_idx)
+                    # 快速路径：空字符串 () ""
+                    if start_idx < len(line) and line[start_idx] == '"':
+                        value = ""
+                    else:
+                        # 先尝试“首引号 + 从行尾逆向查找未转义末引号”的截取，防止中间出现未转义双引号导致提前截断
+                        end_idx = -1
+                        j = len(line) - 1
+                        while j >= start_idx:
+                            if line[j] == '"':
+                                # 统计反斜杠数量
+                                bs = 0
+                                k = j - 1
+                                while k >= start_idx and line[k] == '\\':
+                                    bs += 1
+                                    k -= 1
+                                if bs % 2 == 0:
+                                    end_idx = j
+                                    break
+                            j -= 1
+
+                        if end_idx != -1:
+                            value = line[start_idx:end_idx]
+                        else:
+                            # 退化为跨行拼接直到遇到未转义结束引号
+                            buf = [line[start_idx:]]
+                            li = line_idx + 1
+                            closed = False
+                            while li < total_lines:
+                                next_line = lines[li]
+                                p = 0
+                                n2 = len(next_line)
+                                while p < n2:
+                                    if next_line[p] == '"':
+                                        bs2 = 0
+                                        q = p - 1
+                                        while q >= 0 and next_line[q] == '\\':
+                                            bs2 += 1
+                                            q -= 1
+                                        if bs2 % 2 == 0:
+                                            buf.append(next_line[:p])
+                                            closed = True
+                                            break
+                                    p += 1
+                                if closed:
+                                    line_idx = li
+                                    value = ''.join(buf)
+                                    break
+                                else:
+                                    buf.append(next_line)
+                                    li += 1
+
                     value = self._unescape_aapt_value(value)
                     current_string_data[language] = value
                     self.languages.add(language)
+                    if self.debug and self.debug_key and current_string_name == self.debug_key:
+                        print(f"[aapt2] {current_string_name} ({language}) 原始行: {raw_line}")
+                        print(f"[aapt2] 解析值长度: {len(value)} 内容预览: {repr(value[:80])}")
+                    line_idx += 1
+                    continue
+                else:
+                    # 非值行，跳过，避免将诸如 "resource ... ()" 误判为默认值
+                    if self.debug and (not self.debug_key or (self.debug_key and current_string_name == self.debug_key)):
+                        print(f"[aapt2] 非值行跳过: key={current_string_name} 行={raw_line.strip()[:120]}")
+                    line_idx += 1
+                    continue
         
+            line_idx += 1
+
         # 处理最后一个字符串
         if current_string_name and current_string_data:
             strings_data[current_string_name] = current_string_data
@@ -786,6 +889,21 @@ class APKStringExtractor:
             # 计算占位符异常：改为列出具体异常语言，用、分隔；无异常为空
             anomaly_langs = self._get_placeholder_anomaly_languages(translations, languages)
             row["占位符异常"] = "、".join(anomaly_langs)
+
+            # 调试指定 key 的占位符比较细节
+            if self.debug and self.debug_key and key == self.debug_key:
+                default_lang = languages[0] if languages else "default"
+                default_text = translations.get(default_lang, "")
+                print(f"\n[debug-key] Key={key}")
+                print(f"[debug-key] 默认语言({default_lang}): {repr(default_text)}")
+                default_ph = self._extract_placeholders(default_text)
+                print(f"[debug-key] 默认占位符: {default_ph}")
+                for lang in languages[1:]:
+                    other_text = translations.get(lang, "")
+                    other_ph = self._extract_placeholders(other_text)
+                    same = self._compare_placeholders(default_text, other_text)
+                    print(f"[debug-key] 语言 {lang}: {repr(other_text)}")
+                    print(f"[debug-key]  → 占位符: {other_ph}，一致={same}")
             
             data.append(row)
         
@@ -954,6 +1072,26 @@ def main():
         help="以逗号分隔的语言列表（如: default,zh-rTW,en），用于直接指定导出语言，优先级高于 -l/--lang-config"
     )
     
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="打印解析调试信息"
+    )
+
+    parser.add_argument(
+        "--debug-key",
+        type=str,
+        default=None,
+        help="仅对指定的字符串key打印占位符比较调试信息"
+    )
+    
+    parser.add_argument(
+        "--ignore-keys-file",
+        type=str,
+        default=None,
+        help="忽略的字符串key清单文件路径（每行一个key，支持#注释与空行）"
+    )
+    
     args = parser.parse_args()
     
     try:
@@ -968,6 +1106,8 @@ def main():
         # 提取字符串
         tools_dir = args.tools_dir or (Path(__file__).parent / 'tools')
         with APKStringExtractor(args.apk_path, tools_dir, args.lang_config) as extractor:
+            extractor.debug = bool(args.debug)
+            extractor.debug_key = args.debug_key
             # 覆盖语言配置：--languages 优先
             if args.languages:
                 lang_list = [lang.strip() for lang in args.languages.split(',') if lang.strip()]
@@ -978,6 +1118,28 @@ def main():
             
             # 生成DataFrame
             df = extractor.create_dataframe()
+
+            # 读取忽略的key并过滤
+            ignore_keys: Set[str] = set()
+            if args.ignore_keys_file:
+                ignore_path = Path(args.ignore_keys_file)
+                if not ignore_path.exists():
+                    print(f"警告: 忽略key文件不存在: {ignore_path}")
+                else:
+                    try:
+                        with open(ignore_path, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                line = line.strip()
+                                if not line or line.startswith('#'):
+                                    continue
+                                ignore_keys.add(line)
+                    except Exception as e:
+                        print(f"警告: 读取忽略key文件失败: {e}")
+                if len(ignore_keys) > 0:
+                    before = len(df)
+                    df = df[~df["Key"].isin(ignore_keys)].reset_index(drop=True)
+                    removed = before - len(df)
+                    print(f"已按忽略清单过滤: 移除 {removed} 条（清单共 {len(ignore_keys)} 项）")
             
             # 仅导出占位符异常不为空的行
             if args.errors_only:
