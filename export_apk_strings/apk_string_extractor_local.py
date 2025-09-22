@@ -132,7 +132,7 @@ class APKStringExtractor:
             apk_path: APK文件路径
             tools_dir: 工具目录路径
             lang_config: 语言配置文件路径
-            supported_langs: 支持的语言列表，优先级高于配置文件
+            supported_langs: 支持的业务语言列表，优先级高于配置文件
         """
         self.apk_path = Path(apk_path)
         if not self.apk_path.exists():
@@ -678,15 +678,13 @@ class APKStringExtractor:
             
             # 解析字符串值
             elif current_string_name and '"' in line:
-                # 匹配格式: () "value" 或 (language) "value"
-                match = re.match(r'\s*\(([^)]*)\)\s*"([^"]*)"', line)
-                if match:
-                    language = match.group(1)
-                    value = match.group(2)
-                    
-                    if not language:  # 默认语言
-                        language = "default"
-                    
+                # 尝试解析形如: (lang) "value"
+                m = re.match(r"\s*\(([^)]*)\)\s*\"", line)
+                if m:
+                    language = m.group(1) or "default"
+                    start_idx = m.end()
+                    value = self._consume_quoted(line, start_idx)
+                    value = self._unescape_aapt_value(value)
                     current_string_data[language] = value
                     self.languages.add(language)
         
@@ -695,6 +693,55 @@ class APKStringExtractor:
             strings_data[current_string_name] = current_string_data
         
         return strings_data
+
+    def _consume_quoted(self, text: str, start_idx: int) -> str:
+        """从text的start_idx开始，消费并返回一个支持转义的双引号字符串内容"""
+        buf_chars: List[str] = []
+        i = start_idx
+        n = len(text)
+        while i < n:
+            ch = text[i]
+            if ch == '"':
+                # 检查是否为未被转义的结束引号
+                # 统计前面连续的反斜杠数量
+                bs_count = 0
+                j = i - 1
+                while j >= start_idx and text[j] == '\\':
+                    bs_count += 1
+                    j -= 1
+                if bs_count % 2 == 0:
+                    # 偶数个反斜杠，当前引号未被转义 -> 结束
+                    break
+                # 否则为转义引号，继续收集
+                buf_chars.append(ch)
+                i += 1
+                continue
+            else:
+                buf_chars.append(ch)
+                i += 1
+        return ''.join(buf_chars)
+    
+    def _unescape_aapt_value(self, text: str) -> str:
+        """将aapt2输出中的转义序列还原为实际字符，避免破坏非ASCII字符"""
+        if text is None:
+            return ""
+        # 基础转义
+        text = text.replace('\\"', '"')
+        text = text.replace("\\'", "'")
+        text = text.replace('\\\\', '\\')
+        text = text.replace('\\n', '\n')
+        text = text.replace('\\t', '\t')
+        text = text.replace('\\r', '\r')
+        
+        # 处理 \uXXXX（仅替换有效的四位十六进制）
+        def _replace_unicode(match: re.Match) -> str:
+            try:
+                return chr(int(match.group(1), 16))
+            except Exception:
+                return match.group(0)
+        text = re.sub(r"\\u([0-9a-fA-F]{4})", _replace_unicode, text)
+        
+        return text
     
     def create_dataframe(self) -> pd.DataFrame:
         """
@@ -893,11 +940,18 @@ def main():
         default=None,
         help="语言配置文件路径，每行一个语言代码，用于过滤业务需要的多语言"
     )
-    
+
+    parser.add_argument(
+        "-e", "--errors-only",
+        action="store_true",
+        help="仅导出占位符异常不为空的条目"
+    )
+
     parser.add_argument(
         "--languages",
+        type=str,
         default=None,
-        help="业务支持的多语言列表，用逗号分隔（如：default,zh-rCN,en,ja）。此参数优先级高于 -l 参数"
+        help="以逗号分隔的语言列表（如: default,zh-rTW,en），用于直接指定导出语言，优先级高于 -l/--lang-config"
     )
     
     args = parser.parse_args()
@@ -911,26 +965,56 @@ def main():
             print(f"错误: APK文件不存在: {args.apk_path}")
             sys.exit(1)
         
-        # 解析语言列表参数
-        supported_langs = None
-        if args.languages:
-            supported_langs = [lang.strip() for lang in args.languages.split(',') if lang.strip()]
-            print(f"解析的语言列表: {supported_langs}")
-        
         # 提取字符串
         tools_dir = args.tools_dir or (Path(__file__).parent / 'tools')
-        with APKStringExtractor(args.apk_path, tools_dir, args.lang_config, supported_langs) as extractor:
+        with APKStringExtractor(args.apk_path, tools_dir, args.lang_config) as extractor:
+            # 覆盖语言配置：--languages 优先
+            if args.languages:
+                lang_list = [lang.strip() for lang in args.languages.split(',') if lang.strip()]
+                extractor.supported_languages = lang_list
+                print(f"使用命令行指定的语言列表: {', '.join(lang_list)}")
+            
             extractor.extract_all_strings()
             
+            # 生成DataFrame
+            df = extractor.create_dataframe()
+            
+            # 仅导出占位符异常不为空的行
+            if args.errors_only:
+                if "占位符异常" in df.columns:
+                    before_count = len(df)
+                    df = df[df["占位符异常"].astype(str).str.strip() != ""].reset_index(drop=True)
+                    print(f"已按占位符异常过滤: {len(df)}/{before_count}")
+                else:
+                    print("警告: 当前结果中不存在 '占位符异常' 列，忽略 -e 过滤")
+            
             # 导出文件
+            output_path = args.output
             if args.format == "csv":
-                if not args.output.endswith('.csv'):
-                    args.output = args.output.rsplit('.', 1)[0] + '.csv'
-                extractor.export_to_csv(args.output)
+                if not output_path.endswith('.csv'):
+                    output_path = output_path.rsplit('.', 1)[0] + '.csv'
+                df.to_csv(output_path, index=False, encoding='utf-8-sig')
+                print(f"字符串资源已导出到CSV文件: {output_path}")
             else:
-                if not args.output.endswith('.xlsx'):
-                    args.output = args.output.rsplit('.', 1)[0] + '.xlsx'
-                extractor.export_to_excel(args.output)
+                if not output_path.endswith('.xlsx'):
+                    output_path = output_path.rsplit('.', 1)[0] + '.xlsx'
+                with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                    df.to_excel(writer, sheet_name='Strings', index=False)
+                    # 设置列宽（最多到Z列）
+                    worksheet = writer.sheets['Strings']
+                    for i, column in enumerate(df.columns):
+                        if i >= 26:
+                            break
+                        max_length = max(
+                            df[column].astype(str).map(len).max(),
+                            len(column)
+                        )
+                        max_length = min(max_length, 50)
+                        worksheet.column_dimensions[chr(65 + i)].width = max_length + 2
+                print(f"字符串资源已导出到Excel文件: {output_path}")
+            
+            # 打印摘要
+            extractor._print_summary(df)
         
         print("\n🎉 提取完成!")
         
